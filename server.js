@@ -1,6 +1,7 @@
 require('dotenv').config()
 const express = require('express')
 const cors = require('cors')
+const rateLimit = require('express-rate-limit')
 const fs = require('fs')
 const path = require('path')
 const { Resend } = require('resend')
@@ -8,6 +9,11 @@ const { Resend } = require('resend')
 const app = express()
 app.use(cors())
 app.use(express.json())
+
+// Rate limiting
+const generalLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 100, standardHeaders: true, legacyHeaders: false, message: { error: 'Too many requests, try again later' } })
+const subscribeLimiter = rateLimit({ windowMs: 60 * 60 * 1000, max: 10, standardHeaders: true, legacyHeaders: false, message: { error: 'Too many subscribe attempts, try again later' } })
+app.use('/api/', generalLimiter)
 
 const DATA_DIR = path.join(__dirname, 'data')
 const SUBS_FILE = path.join(DATA_DIR, 'subscribers.json')
@@ -59,7 +65,7 @@ async function sendWelcomeEmail(email) {
 }
 
 // Subscribers
-app.post('/api/subscribe', async (req, res) => {
+app.post('/api/subscribe', subscribeLimiter, async (req, res) => {
   const { email, agent_id } = req.body
   if (!email && !agent_id) return res.status(400).json({ error: 'email or agent_id required' })
   
