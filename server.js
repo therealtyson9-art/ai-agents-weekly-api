@@ -2,8 +2,7 @@ require('dotenv').config()
 const express = require('express')
 const cors = require('cors')
 const rateLimit = require('express-rate-limit')
-const fs = require('fs')
-const path = require('path')
+const { createClient } = require('@supabase/supabase-js')
 const { Resend } = require('resend')
 
 const app = express()
@@ -15,22 +14,14 @@ const generalLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 100, standardH
 const subscribeLimiter = rateLimit({ windowMs: 60 * 60 * 1000, max: 10, standardHeaders: true, legacyHeaders: false, message: { error: 'Too many subscribe attempts, try again later' } })
 app.use('/api/', generalLimiter)
 
-const DATA_DIR = path.join(__dirname, 'data')
-const SUBS_FILE = path.join(DATA_DIR, 'subscribers.json')
-const ISSUES_FILE = path.join(DATA_DIR, 'issues.json')
+// Supabase
+const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY)
 
+// Resend
 const resend = new Resend(process.env.RESEND_API_KEY)
 const FROM_EMAIL = process.env.FROM_EMAIL || 'AI Agents Weekly <onboarding@resend.dev>'
 
-function readJSON(file, fallback) {
-  try { return JSON.parse(fs.readFileSync(file, 'utf-8')) } catch { return fallback }
-}
-function writeJSON(file, data) {
-  fs.mkdirSync(path.dirname(file), { recursive: true })
-  fs.writeFileSync(file, JSON.stringify(data, null, 2))
-}
-
-// Send welcome email
+// Welcome email
 async function sendWelcomeEmail(email) {
   try {
     await resend.emails.send({
@@ -41,19 +32,14 @@ async function sendWelcomeEmail(email) {
         <div style="font-family: -apple-system, sans-serif; max-width: 600px; margin: 0 auto; background: #0a0a0a; color: #eee; padding: 40px; border-radius: 12px;">
           <h1 style="color: #fff; font-size: 24px; margin-bottom: 8px;">Welcome to AI Agents Weekly</h1>
           <p style="color: #888; font-size: 14px; margin-bottom: 24px;">The newsletter written entirely by AI agents.</p>
-          
           <p style="color: #ccc; font-size: 15px; line-height: 1.6;">
             You're now subscribed. Every week, our autonomous AI agents will research, curate, and deliver the most important developments in the AI agent ecosystem — directly to your inbox.
           </p>
-          
           <p style="color: #ccc; font-size: 15px; line-height: 1.6; margin-top: 16px;">
-            <strong style="color: #00ff88;">Issue #1 is coming soon.</strong> We're gathering subscribers before our first launch. Stay tuned.
+            <strong style="color: #00ff88;">Check out our latest issue at <a href="https://aiagentsweekly.com" style="color: #00d4ff;">aiagentsweekly.com</a></strong>
           </p>
-          
           <div style="margin-top: 32px; padding-top: 24px; border-top: 1px solid #1a1a1a;">
-            <p style="color: #555; font-size: 12px;">
-              Built autonomously by AI agents — <a href="https://aiagentsweekly.com" style="color: #00d4ff;">aiagentsweekly.com</a>
-            </p>
+            <p style="color: #555; font-size: 12px;">Built autonomously by AI agents</p>
           </div>
         </div>
       `
@@ -64,162 +50,159 @@ async function sendWelcomeEmail(email) {
   }
 }
 
-// Subscribers
+// ── Subscribers ──
+
 app.post('/api/subscribe', subscribeLimiter, async (req, res) => {
   const { email, agent_id } = req.body
   if (!email && !agent_id) return res.status(400).json({ error: 'email or agent_id required' })
-  
-  const subs = readJSON(SUBS_FILE, [])
+
   const id = email || `agent:${agent_id}`
   const type = email ? 'human' : 'agent'
-  
-  if (subs.find(s => s.id === id)) {
-    return res.json({ status: 'already_subscribed', subscriber_count: subs.length })
+
+  // Check if already subscribed
+  const { data: existing } = await supabase.from('subscribers').select('id').eq('id', id).single()
+  if (existing) {
+    const { count } = await supabase.from('subscribers').select('*', { count: 'exact', head: true })
+    return res.json({ status: 'already_subscribed', subscriber_count: count })
   }
-  
-  subs.push({ id, type, created: new Date().toISOString() })
-  writeJSON(SUBS_FILE, subs)
-  
-  // Send welcome email for humans
-  if (email) {
-    sendWelcomeEmail(email)
-  }
-  
-  console.log(`New subscriber: ${id} (${type}) — total: ${subs.length}`)
-  res.json({ status: 'subscribed', message: `Welcome, ${id}`, subscriber_count: subs.length })
+
+  const { error } = await supabase.from('subscribers').insert({
+    id, email: email || null, agent_id: agent_id || null, type,
+    callback_url: req.body.callback_url || null
+  })
+
+  if (error) return res.status(500).json({ error: error.message })
+
+  const { count } = await supabase.from('subscribers').select('*', { count: 'exact', head: true })
+
+  if (email) sendWelcomeEmail(email)
+
+  console.log(`New subscriber: ${id} (${type}) — total: ${count}`)
+  res.json({ status: 'subscribed', message: `Welcome, ${id}`, subscriber_count: count })
 })
 
-app.get('/api/subscribe', (req, res) => {
-  const subs = readJSON(SUBS_FILE, [])
-  res.json({ subscriber_count: subs.length, subscribers: subs })
+app.get('/api/subscribe', async (req, res) => {
+  const { data, count } = await supabase.from('subscribers').select('*', { count: 'exact' })
+  res.json({ subscriber_count: count, subscribers: data })
 })
 
-// Issues
-app.get('/api/issues', (req, res) => {
-  const issues = readJSON(ISSUES_FILE, [])
-  res.json(issues)
+// ── Issues ──
+
+app.get('/api/issues', async (req, res) => {
+  const { data } = await supabase.from('issues').select('*').order('published_at', { ascending: false })
+  res.json((data || []).map(mapIssue))
 })
 
-app.get('/api/latest', (req, res) => {
-  const issues = readJSON(ISSUES_FILE, [])
-  if (issues.length === 0) {
+app.get('/api/latest', async (req, res) => {
+  const { data } = await supabase.from('issues').select('*').eq('status', 'published').order('published_at', { ascending: false }).limit(1)
+
+  if (!data || data.length === 0) {
     return res.json({
-      id: 'issue-000',
-      title: 'AI Agents Weekly - Launching Soon',
+      id: 'issue-000', title: 'AI Agents Weekly - Launching Soon',
       date: new Date().toISOString().split('T')[0],
-      summary: 'The first fully autonomous AI newsletter is being prepared. Issue #1 coming soon.',
-      contentItems: 0,
-      readTime: '0 min',
-      status: 'generating'
+      summary: 'The first fully autonomous AI newsletter is being prepared.',
+      contentItems: 0, readTime: '0 min', status: 'generating'
     })
   }
-  res.json(issues[issues.length - 1])
+  res.json(mapIssue(data[0]))
 })
 
-app.post('/api/issues', (req, res) => {
-  const issues = readJSON(ISSUES_FILE, [])
+app.get('/api/issues/:id', async (req, res) => {
+  const { data, error } = await supabase.from('issues').select('*').eq('id', req.params.id).single()
+  if (error || !data) return res.status(404).json({ error: 'Issue not found' })
+  res.json(mapIssue(data))
+})
+
+app.post('/api/issues', async (req, res) => {
+  const { count } = await supabase.from('issues').select('*', { count: 'exact', head: true })
   const issue = {
-    ...req.body,
-    id: `issue-${String(issues.length + 1).padStart(3, '0')}`,
-    publishedAt: new Date().toISOString(),
-    status: 'published'
+    id: req.body.id || `issue-${String((count || 0) + 1).padStart(3, '0')}`,
+    title: req.body.title,
+    date: req.body.date || new Date().toISOString().split('T')[0],
+    summary: req.body.summary,
+    content: req.body.content,
+    content_items: req.body.contentItems || 0,
+    read_time: req.body.readTime || null,
+    status: 'published',
+    published_at: new Date().toISOString()
   }
-  issues.push(issue)
-  writeJSON(ISSUES_FILE, issues)
-  res.json(issue)
+
+  const { error } = await supabase.from('issues').upsert(issue)
+  if (error) return res.status(500).json({ error: error.message })
+  res.json(mapIssue(issue))
 })
 
-app.get('/api/status', (req, res) => {
-  const subs = readJSON(SUBS_FILE, [])
-  const issues = readJSON(ISSUES_FILE, [])
+// Map DB columns to API format
+function mapIssue(row) {
+  return {
+    id: row.id, title: row.title, date: row.date, summary: row.summary,
+    content: row.content, contentItems: row.content_items,
+    readTime: row.read_time, status: row.status, publishedAt: row.published_at
+  }
+}
+
+// ── Status & Stats ──
+
+app.get('/api/status', async (req, res) => {
+  const { count: subCount } = await supabase.from('subscribers').select('*', { count: 'exact', head: true })
+  const { count: issueCount } = await supabase.from('issues').select('*', { count: 'exact', head: true })
   res.json({
-    systemHealth: 'healthy',
-    autonomousMode: true,
-    subscriberCount: subs.length,
-    issuesPublished: issues.length,
-    sourcesMonitored: 20,
-    uptime: process.uptime(),
-    timestamp: new Date().toISOString(),
-    version: '1.0.0'
+    systemHealth: 'healthy', autonomousMode: true,
+    subscriberCount: subCount, issuesPublished: issueCount,
+    sourcesMonitored: 20, uptime: process.uptime(),
+    timestamp: new Date().toISOString(), version: '2.0.0-supabase'
   })
 })
 
-// Stats for frontend
-app.get('/api/stats', (req, res) => {
-  const subs = readJSON(SUBS_FILE, [])
-  const issues = readJSON(ISSUES_FILE, [])
-  res.json({
-    subscribers: subs.length,
-    issues: issues.length,
-    articles: issues.reduce((sum, i) => sum + (i.contentItems || 0), 0),
-    sources: 20
-  })
+app.get('/api/stats', async (req, res) => {
+  const { count: subCount } = await supabase.from('subscribers').select('*', { count: 'exact', head: true })
+  const { data: issues } = await supabase.from('issues').select('content_items')
+  const issueCount = issues ? issues.length : 0
+  const articles = issues ? issues.reduce((sum, i) => sum + (i.content_items || 0), 0) : 0
+  res.json({ subscribers: subCount, issues: issueCount, articles, sources: 20 })
 })
 
-// Send newsletter to all human subscribers
+// ── Newsletter Send ──
+
 app.post('/api/send-newsletter', async (req, res) => {
   const { issueId } = req.body
-  const issues = readJSON(ISSUES_FILE, [])
-  const issue = issues.find(i => i.id === issueId)
+  const { data: issue } = await supabase.from('issues').select('*').eq('id', issueId).single()
   if (!issue) return res.status(404).json({ error: 'Issue not found' })
 
-  const subs = readJSON(SUBS_FILE, [])
-  const humans = subs.filter(s => s.type === 'human')
-  
+  const { data: subs } = await supabase.from('subscribers').select('*').eq('type', 'human')
   let sent = 0
-  for (const sub of humans) {
+  for (const sub of (subs || [])) {
     try {
       await resend.emails.send({
-        from: FROM_EMAIL,
-        to: sub.id,
+        from: FROM_EMAIL, to: sub.email || sub.id,
         subject: `AI Agents Weekly: ${issue.title}`,
-        html: issue.htmlContent || `<p>${issue.summary}</p>`
+        html: issue.html_content || `<p>${issue.summary}</p>`
       })
       sent++
-    } catch (err) {
-      console.error(`Failed to send to ${sub.id}:`, err.message)
-    }
+    } catch (err) { console.error(`Failed to send to ${sub.id}:`, err.message) }
   }
-  
-  res.json({ sent, total: humans.length })
+  res.json({ sent, total: (subs || []).length })
 })
 
-// Webhook endpoint for agent subscribers
-app.post('/api/webhook', (req, res) => {
+// ── Webhooks ──
+
+app.post('/api/webhook', async (req, res) => {
   const { agent_id, callback_url, events } = req.body
-  if (!agent_id || !callback_url) {
-    return res.status(400).json({ error: 'agent_id and callback_url required' })
-  }
-  
-  const webhooksFile = path.join(DATA_DIR, 'webhooks.json')
-  const webhooks = readJSON(webhooksFile, [])
-  
-  const existing = webhooks.findIndex(w => w.agent_id === agent_id)
-  const webhook = {
-    agent_id,
-    callback_url,
-    events: events || ['new_issue'],
-    created: new Date().toISOString(),
-    active: true
-  }
-  
-  if (existing >= 0) {
-    webhooks[existing] = { ...webhooks[existing], ...webhook, updated: new Date().toISOString() }
-  } else {
-    webhooks.push(webhook)
-  }
-  
-  writeJSON(webhooksFile, webhooks)
+  if (!agent_id || !callback_url) return res.status(400).json({ error: 'agent_id and callback_url required' })
+
+  const { error } = await supabase.from('webhooks').upsert({
+    agent_id, callback_url, events: events || ['new_issue']
+  })
+  if (error) return res.status(500).json({ error: error.message })
+
   console.log(`Webhook registered for agent ${agent_id} → ${callback_url}`)
-  res.json({ status: 'registered', agent_id, events: webhook.events })
+  res.json({ status: 'registered', agent_id, events: events || ['new_issue'] })
 })
 
-// List webhooks
-app.get('/api/webhook', (req, res) => {
-  const webhooksFile = path.join(DATA_DIR, 'webhooks.json')
-  const webhooks = readJSON(webhooksFile, [])
-  res.json({ count: webhooks.length, webhooks })
+app.get('/api/webhook', async (req, res) => {
+  const { data, count } = await supabase.from('webhooks').select('*', { count: 'exact' })
+  res.json({ count, webhooks: data })
 })
 
 const PORT = process.env.PORT || 3848
-app.listen(PORT, () => console.log(`AI Agents Weekly API running on port ${PORT}`))
+app.listen(PORT, () => console.log(`AI Agents Weekly API v2.0 (Supabase) running on port ${PORT}`))
