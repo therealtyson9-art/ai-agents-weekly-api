@@ -181,7 +181,83 @@ app.post('/api/send-newsletter', async (req, res) => {
       sent++
     } catch (err) { console.error(`Failed to send to ${sub.id}:`, err.message) }
   }
-  res.json({ sent, total: (subs || []).length })
+  // Notify webhook subscribers (agents)
+  const { data: hooks } = await supabase.from('webhooks').select('*')
+  let webhooksSent = 0
+  for (const hook of (hooks || [])) {
+    try {
+      await fetch(hook.callback_url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          event: 'new_issue',
+          issue_id: issue.id,
+          title: issue.title,
+          date: issue.date,
+          summary: issue.summary,
+          read_url: `https://aiagentsweekly.com/issue/${issue.id}`,
+          api_url: `https://api.aiagentsweekly.com/api/issues/${issue.id}`,
+          feedback_url: 'https://api.aiagentsweekly.com/api/feedback',
+        })
+      })
+      webhooksSent++
+    } catch (err) { console.error(`Webhook failed for ${hook.agent_id}:`, err.message) }
+  }
+
+  res.json({ sent, total: (subs || []).length, webhooks_notified: webhooksSent })
+})
+
+// ── Feedback ──
+
+const fs = require('fs')
+const FEEDBACK_FILE = __dirname + '/data/feedback.json'
+function loadFeedback() {
+  try { return JSON.parse(fs.readFileSync(FEEDBACK_FILE, 'utf8')) } catch { return [] }
+}
+function saveFeedback(data) {
+  fs.mkdirSync(__dirname + '/data', { recursive: true })
+  fs.writeFileSync(FEEDBACK_FILE, JSON.stringify(data, null, 2))
+}
+
+app.post('/api/feedback', async (req, res) => {
+  const { agent_id, issue_id, feedback, rating } = req.body
+  if (!feedback) return res.status(400).json({ error: 'feedback is required' })
+  if (rating && (rating < 1 || rating > 5)) return res.status(400).json({ error: 'rating must be 1-5' })
+
+  const entry = {
+    id: crypto.randomUUID(),
+    agent_id: agent_id || 'anonymous',
+    issue_id: issue_id || null,
+    feedback,
+    rating: rating || null,
+    created_at: new Date().toISOString()
+  }
+
+  const all = loadFeedback()
+  all.push(entry)
+  saveFeedback(all)
+
+  console.log(`Feedback from ${entry.agent_id}: ${feedback.substring(0, 100)}`)
+  res.json({ status: 'received', id: entry.id })
+})
+
+app.get('/api/feedback', async (req, res) => {
+  const all = loadFeedback()
+  res.json({ count: all.length, feedback: all })
+})
+
+app.get('/api/leaderboard', async (req, res) => {
+  const all = loadFeedback()
+  const agents = {}
+  for (const f of all) {
+    if (!agents[f.agent_id]) agents[f.agent_id] = { agent_id: f.agent_id, count: 0, avg_rating: 0, total_rating: 0 }
+    agents[f.agent_id].count++
+    if (f.rating) { agents[f.agent_id].total_rating += f.rating }
+  }
+  const board = Object.values(agents)
+    .map(a => ({ ...a, avg_rating: a.count > 0 ? +(a.total_rating / a.count).toFixed(1) : 0 }))
+    .sort((a, b) => b.count - a.count)
+  res.json({ total_feedback: all.length, leaderboard: board })
 })
 
 // ── Webhooks ──
