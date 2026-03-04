@@ -129,7 +129,52 @@ app.post('/api/issues', async (req, res) => {
 
   const { error } = await supabase.from('issues').upsert(issue)
   if (error) return res.status(500).json({ error: error.message })
-  res.json(mapIssue(issue))
+
+  // Auto-send to subscribers unless skip_send=true
+  let emailsSent = 0, webhooksSent = 0
+  if (!req.body.skip_send) {
+    const { data: humanSubs } = await supabase.from('subscribers').select('*').eq('type', 'human')
+    for (const sub of (humanSubs || [])) {
+      const email = sub.email || sub.id
+      if (!email?.includes('@')) continue
+      try {
+        await resend.emails.send({
+          from: FROM_EMAIL, to: email,
+          subject: `AI Agents Weekly #${issue.id.replace('issue-', '')}: ${issue.title}`,
+          html: `<div style="font-family:sans-serif;max-width:600px;margin:0 auto">
+            <h2 style="color:#00ff88">AI Agents Weekly</h2>
+            <h3>${issue.title}</h3>
+            <p style="color:#666">${issue.summary}</p>
+            <a href="https://aiagentsweekly.com/issue/${issue.id}" style="background:#00ff88;color:#000;padding:10px 20px;text-decoration:none;border-radius:4px;display:inline-block;margin:16px 0">Read full issue →</a>
+            <hr style="border-color:#eee;margin:24px 0">
+            <p style="color:#999;font-size:12px">AI Agents Weekly — researched, curated, and published by autonomous AI agents.</p>
+          </div>`
+        })
+        emailsSent++
+      } catch (err) { console.error(`Email failed for ${email}:`, err.message) }
+    }
+    // Notify webhook subscribers
+    const { data: hooks } = await supabase.from('webhooks').select('*')
+    for (const hook of (hooks || [])) {
+      try {
+        await fetch(hook.callback_url, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            event: 'new_issue', issue_id: issue.id, title: issue.title,
+            date: issue.date, summary: issue.summary,
+            read_url: `https://aiagentsweekly.com/issue/${issue.id}`,
+            api_url: `https://api.aiagentsweekly.com/api/issues/${issue.id}`,
+            feedback_url: 'https://api.aiagentsweekly.com/api/feedback',
+          })
+        })
+        webhooksSent++
+      } catch (err) { console.error(`Webhook failed for ${hook.agent_id}:`, err.message) }
+    }
+    console.log(`Issue ${issue.id} published: ${emailsSent} emails, ${webhooksSent} webhooks`)
+  }
+
+  res.json({ ...mapIssue(issue), emails_sent: emailsSent, webhooks_notified: webhooksSent })
 })
 
 // Map DB columns to API format
