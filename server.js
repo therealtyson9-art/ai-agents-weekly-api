@@ -21,6 +21,91 @@ const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SER
 const resend = new Resend(process.env.RESEND_API_KEY)
 const FROM_EMAIL = process.env.FROM_EMAIL || 'AI Agents Weekly <onboarding@resend.dev>'
 
+// ── Email Templates ──
+
+function buildEmailHtml(issue) {
+  const issueNum = issue.id.replace('issue-', '')
+  const readUrl = `https://aiagentsweekly.com/issue/${issue.id}`
+  const unsubUrl = `https://api.aiagentsweekly.com/api/unsubscribe?email={{email}}`
+
+  // Extract content sections from markdown for preview
+  const sections = (issue.content || '')
+    .split('\n## ')
+    .slice(1, 4)  // up to 3 sections
+    .map(s => {
+      const lines = s.split('\n').filter(l => l.trim())
+      const title = lines[0]?.replace(/^#+\s*/, '').trim() || ''
+      const body = lines.slice(1).join(' ').replace(/[*_`#]/g, '').substring(0, 180).trim()
+      return { title, body: body + (body.length >= 180 ? '...' : '') }
+    })
+    .filter(s => s.title)
+
+  const sectionHtml = sections.map(s => `
+    <div style="border-left:3px solid #00ff88;padding:12px 16px;margin:16px 0;background:#0f0f0f;border-radius:0 8px 8px 0">
+      <div style="font-size:13px;font-weight:700;color:#00ff88;margin-bottom:6px;font-family:'Courier New',monospace">${s.title}</div>
+      <div style="font-size:14px;color:#999;line-height:1.6">${s.body}</div>
+    </div>`).join('')
+
+  return `<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head>
+<body style="margin:0;padding:0;background:#000;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif">
+  <div style="max-width:600px;margin:0 auto;background:#000">
+
+    <!-- Header -->
+    <div style="background:#000;border-bottom:1px solid #1a1a1a;padding:20px 32px;display:flex;align-items:center;justify-content:space-between">
+      <div>
+        <div style="font-family:'Courier New',monospace;font-size:11px;color:#555;margin-bottom:4px">&#9679; SYSTEM ONLINE</div>
+        <div style="font-size:20px;font-weight:700;color:#fff;letter-spacing:-0.5px">AI_AGENTS_WEEKLY</div>
+      </div>
+      <div style="font-family:'Courier New',monospace;font-size:11px;color:#333;text-align:right">
+        ISSUE #${issueNum}<br>${issue.date || new Date().toISOString().split('T')[0]}
+      </div>
+    </div>
+
+    <!-- Hero -->
+    <div style="padding:40px 32px 32px;border-bottom:1px solid #1a1a1a">
+      <div style="font-family:'Courier New',monospace;font-size:11px;color:#555;margin-bottom:12px">&#62; latest_issue --read</div>
+      <h1 style="margin:0 0 16px;font-size:26px;font-weight:700;line-height:1.3;color:#fff">${issue.title}</h1>
+      <p style="margin:0 0 28px;font-size:16px;color:#888;line-height:1.6">${issue.summary}</p>
+      <a href="${readUrl}" style="display:inline-block;background:#00ff88;color:#000;font-weight:700;font-size:14px;padding:12px 28px;border-radius:8px;text-decoration:none;font-family:-apple-system,sans-serif">Read full issue &rarr;</a>
+    </div>
+
+    <!-- Sections preview -->
+    ${sectionHtml ? `<div style="padding:28px 32px;border-bottom:1px solid #1a1a1a">
+      <div style="font-family:'Courier New',monospace;font-size:11px;color:#555;margin-bottom:16px">&#62; preview --sections</div>
+      ${sectionHtml}
+      <div style="margin-top:20px;text-align:center">
+        <a href="${readUrl}" style="font-family:'Courier New',monospace;font-size:13px;color:#00ff88;text-decoration:none">&#62; read_all_sections &rarr;</a>
+      </div>
+    </div>` : ''}
+
+    <!-- Agent CTA -->
+    <div style="padding:28px 32px;background:#050505;border-bottom:1px solid #1a1a1a">
+      <div style="font-family:'Courier New',monospace;font-size:11px;color:#555;margin-bottom:12px">&#62; share_with_agent</div>
+      <p style="margin:0 0 12px;font-size:13px;color:#666;line-height:1.6">Have an AI agent? Subscribe it to receive issues directly via webhook:</p>
+      <div style="background:#0a0a0a;border:1px solid #1a1a1a;border-radius:8px;padding:14px 16px;font-family:'Courier New',monospace;font-size:12px;color:#888;overflow-x:auto">
+        curl -X POST https://api.aiagentsweekly.com/api/subscribe<br>
+        &nbsp;&nbsp;-H "Content-Type: application/json"<br>
+        &nbsp;&nbsp;-d '{"agent_id": "your-agent-id"}'
+      </div>
+    </div>
+
+    <!-- Footer -->
+    <div style="padding:24px 32px;text-align:center">
+      <div style="display:inline-block;width:6px;height:6px;border-radius:50%;background:#00ff88;margin-bottom:12px"></div>
+      <div style="font-family:'Courier New',monospace;font-size:11px;color:#333;margin-bottom:8px">ALL SYSTEMS NOMINAL &mdash; &copy; ${new Date().getFullYear()} AI_AGENTS_WEEKLY</div>
+      <div style="font-size:11px;color:#333">
+        Researched, curated, and published by autonomous AI agents. &nbsp;&middot;&nbsp;
+        <a href="${unsubUrl}" style="color:#333;text-decoration:underline">Unsubscribe</a>
+      </div>
+    </div>
+
+  </div>
+</body>
+</html>`
+}
+
 // Welcome email
 async function sendWelcomeEmail(email) {
   try {
@@ -141,14 +226,7 @@ app.post('/api/issues', async (req, res) => {
         await resend.emails.send({
           from: FROM_EMAIL, to: email,
           subject: `AI Agents Weekly #${issue.id.replace('issue-', '')}: ${issue.title}`,
-          html: `<div style="font-family:sans-serif;max-width:600px;margin:0 auto">
-            <h2 style="color:#00ff88">AI Agents Weekly</h2>
-            <h3>${issue.title}</h3>
-            <p style="color:#666">${issue.summary}</p>
-            <a href="https://aiagentsweekly.com/issue/${issue.id}" style="background:#00ff88;color:#000;padding:10px 20px;text-decoration:none;border-radius:4px;display:inline-block;margin:16px 0">Read full issue →</a>
-            <hr style="border-color:#eee;margin:24px 0">
-            <p style="color:#999;font-size:12px">AI Agents Weekly — researched, curated, and published by autonomous AI agents.</p>
-          </div>`
+          html: buildEmailHtml(issue)
         })
         emailsSent++
       } catch (err) { console.error(`Email failed for ${email}:`, err.message) }
@@ -220,8 +298,8 @@ app.post('/api/send-newsletter', async (req, res) => {
     try {
       await resend.emails.send({
         from: FROM_EMAIL, to: sub.email || sub.id,
-        subject: `AI Agents Weekly: ${issue.title}`,
-        html: issue.html_content || `<p>${issue.summary}</p>`
+        subject: `AI Agents Weekly #${issue.id.replace('issue-','')}: ${issue.title}`,
+        html: buildEmailHtml(issue)
       })
       sent++
     } catch (err) { console.error(`Failed to send to ${sub.id}:`, err.message) }
