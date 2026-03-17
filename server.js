@@ -1,4 +1,6 @@
 require('dotenv').config()
+const fs = require('fs')
+const path = require('path')
 const express = require('express')
 const cors = require('cors')
 const rateLimit = require('express-rate-limit')
@@ -6,6 +8,7 @@ const { createClient } = require('@supabase/supabase-js')
 const { Resend } = require('resend')
 
 const app = express()
+app.set('trust proxy', 1) // Trust Cloudflare tunnel proxy headers
 app.use(cors())
 app.use(express.json())
 
@@ -192,6 +195,85 @@ app.get('/api/latest', async (req, res) => {
   res.json(mapIssue(data[0]))
 })
 
+// --- Research stories endpoint (for tweet cron) ---
+app.get('/api/research/latest', (req, res) => {
+  const draftsDir = path.join(__dirname, 'drafts')
+  // Find the most recent research file
+  const files = fs.readdirSync(draftsDir)
+    .filter(f => f.startsWith('research-2026-'))
+    .sort()
+    .reverse()
+  if (!files.length) return res.json({ stories: [], file: null })
+
+  const filePath = path.join(draftsDir, files[0])
+  const content = fs.readFileSync(filePath, 'utf-8')
+
+  // Parse ### headers as stories
+  const stories = []
+  const sections = content.split(/^### /gm).slice(1)
+  for (const section of sections) {
+    const lines = section.trim().split('\n')
+    const title = lines[0].trim()
+    const body = lines.slice(1).join('\n').trim()
+    const urlMatch = body.match(/\*\*URL:\*\*\s*(.+)/i) || body.match(/🔗\s*(.+)/i)
+    stories.push({
+      title,
+      summary: body.replace(/\*\*URL:\*\*.*$/m, '').trim().slice(0, 280),
+      url: urlMatch ? urlMatch[1].trim() : null
+    })
+  }
+
+  res.json({ stories, count: stories.length, file: files[0] })
+})
+
+// POST /api/research and /api/research/add — accept stories from external sources (KShull X search, etc.)
+// Both routes supported for compatibility
+const researchAddHandler = (req, res) => {
+  const { stories, date } = req.body
+  if (!stories || !Array.isArray(stories) || !stories.length) {
+    return res.status(400).json({ error: 'stories array required' })
+  }
+
+  const draftsDir = path.join(__dirname, 'drafts')
+  if (!fs.existsSync(draftsDir)) fs.mkdirSync(draftsDir, { recursive: true })
+
+  // Find current week's research file
+  const files = fs.readdirSync(draftsDir)
+    .filter(f => f.startsWith('research-2026-'))
+    .sort()
+    .reverse()
+  const targetFile = files[0] || `research-2026-W${String(Math.ceil((Date.now() - new Date('2026-01-01')) / (7 * 24 * 60 * 60 * 1000))).padStart(2, '0')}.md`
+  const filePath = path.join(draftsDir, targetFile)
+
+  // Read existing to deduplicate
+  const existing = fs.existsSync(filePath) ? fs.readFileSync(filePath, 'utf-8') : ''
+
+  let added = 0
+  let appendText = ''
+  const dateStr = date || new Date().toISOString().split('T')[0]
+
+  for (const story of stories) {
+    if (!story.title) continue
+    // Skip if title already exists
+    if (existing.includes(story.title)) continue
+
+    appendText += `\n### ${story.title}\n`
+    if (story.summary) appendText += `${story.summary}\n`
+    if (story.url) appendText += `**URL:** ${story.url}\n`
+    if (story.source) appendText += `**Source:** ${story.source}\n`
+    added++
+  }
+
+  if (added > 0) {
+    const header = `\n---\n\n## External Research: ${dateStr}\n`
+    fs.appendFileSync(filePath, existing.includes(`## External Research: ${dateStr}`) ? appendText : header + appendText)
+  }
+
+  res.json({ added, total: added, file: targetFile, date: dateStr })
+}
+app.post('/api/research/add', researchAddHandler)
+app.post('/api/research', researchAddHandler) // alias for compatibility
+
 app.get('/api/issues/:id', async (req, res) => {
   const { data, error } = await supabase.from('issues').select('*').eq('id', req.params.id).single()
   if (error || !data) return res.status(404).json({ error: 'Issue not found' })
@@ -208,16 +290,16 @@ app.post('/api/issues', async (req, res) => {
     content: req.body.content,
     content_items: req.body.contentItems || 0,
     read_time: req.body.readTime || null,
-    status: 'published',
-    published_at: new Date().toISOString()
+    status: req.body.status || 'published',
+    published_at: req.body.status === 'draft' ? null : new Date().toISOString()
   }
 
   const { error } = await supabase.from('issues').upsert(issue)
   if (error) return res.status(500).json({ error: error.message })
 
-  // Auto-send to subscribers unless skip_send=true
+  // Auto-send to subscribers only when publishing (not drafts), unless skip_send=true
   let emailsSent = 0, webhooksSent = 0
-  if (!req.body.skip_send) {
+  if (issue.status === 'published' && !req.body.skip_send) {
     const { data: humanSubs } = await supabase.from('subscribers').select('*').eq('type', 'human')
     for (const sub of (humanSubs || [])) {
       const email = sub.email || sub.id
@@ -332,7 +414,6 @@ app.post('/api/send-newsletter', async (req, res) => {
 
 // ── Feedback ──
 
-const fs = require('fs')
 const FEEDBACK_FILE = __dirname + '/data/feedback.json'
 function loadFeedback() {
   try { return JSON.parse(fs.readFileSync(FEEDBACK_FILE, 'utf8')) } catch { return [] }
@@ -401,6 +482,44 @@ app.post('/api/webhook', async (req, res) => {
 app.get('/api/webhook', async (req, res) => {
   const { data, count } = await supabase.from('webhooks').select('*', { count: 'exact' })
   res.json({ count, webhooks: data })
+})
+
+// ── GET /api/card — Generate branded tweet card PNG ──
+// Query params: title, stat, sub, source
+// Returns: image/png (1200x628)
+app.get('/api/card', (req, res) => {
+  const { title, stat, sub = '', source = 'aiagentsweekly.com' } = req.query
+  if (!title || !stat) {
+    return res.status(400).json({ error: 'title and stat are required' })
+  }
+  const { execFile } = require('child_process')
+  const tmpPath = `/tmp/aaw-card-${Date.now()}.png`
+  const scriptPath = path.join(__dirname, 'scripts', 'generate-card.py')
+  const args = [
+    scriptPath,
+    '--title', title,
+    '--stat', stat,
+    '--sub', sub,
+    '--source', source,
+    '--out', tmpPath
+  ]
+  execFile('python3', args, { timeout: 15000 }, (err) => {
+    if (err) {
+      console.error('Card generation error:', err.message)
+      return res.status(500).json({ error: 'Card generation failed', details: err.message })
+    }
+    res.setHeader('Content-Type', 'image/png')
+    res.setHeader('Cache-Control', 'no-cache')
+    const stream = fs.createReadStream(tmpPath)
+    stream.pipe(res)
+    stream.on('end', () => {
+      fs.unlink(tmpPath, () => {})
+    })
+    stream.on('error', (e) => {
+      console.error('Stream error:', e.message)
+      res.status(500).json({ error: 'Failed to stream image' })
+    })
+  })
 })
 
 const PORT = process.env.PORT || 3848
